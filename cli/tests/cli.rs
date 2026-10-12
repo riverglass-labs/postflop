@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use engine::current_street::{Child, CurrentStreetPolicy};
 use engine::solution::{ActionLabelData, Solution};
 
 fn bin() -> Command {
@@ -15,8 +16,104 @@ fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/river.toml")
 }
 
+#[test]
+fn compact_current_street_cli_export_is_traversable() {
+    let dir = std::env::temp_dir().join(format!("solver_compact_cli_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("policy.json");
+    let result = bin()
+        .args([
+            "solve",
+            "--config",
+            fixture().to_str().unwrap(),
+            "--max-iterations",
+            "1",
+            "--report-every",
+            "1",
+            "--current-street-out",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let policy = CurrentStreetPolicy::load(&out).unwrap();
+    assert_eq!(policy.meta.iterations, 1);
+    assert!(policy
+        .nodes
+        .iter()
+        .all(|n| n.actions.iter().all(|a| match a.child {
+            Child::Decision { node } => policy.nodes.iter().any(|child| child.node == node),
+            _ => true,
+        })));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn checkpoint_cli_exports_exact_iterations_from_one_solve() {
+    let dir = std::env::temp_dir().join(format!("solver_checkpoints_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let result = bin()
+        .args([
+            "solve",
+            "--config",
+            fixture().to_str().unwrap(),
+            "--max-iterations",
+            "3",
+            "--target-exploitability",
+            "1000",
+            "--checkpoint-dir",
+            dir.to_str().unwrap(),
+            "--checkpoint-iterations",
+            "1,2,3",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let policies: Vec<_> = (1..=3)
+        .map(|n| CurrentStreetPolicy::load(dir.join(format!("iter_{n:06}.json"))).unwrap())
+        .collect();
+    for (n, policy) in policies.iter().enumerate() {
+        assert_eq!(policy.meta.iterations, (n + 1) as u64);
+        assert!(policy.meta.metric_pct_of_pot.is_finite());
+        assert!(policy.meta.wall_seconds >= 0.0);
+        assert!(policy.meta.storage_bytes > 0);
+    }
+    assert!(policies[0].meta.wall_seconds <= policies[1].meta.wall_seconds);
+    assert!(policies[1].meta.wall_seconds <= policies[2].meta.wall_seconds);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn checkpoint_cli_rejects_nonmonotonic_iterations() {
+    let result = bin()
+        .args([
+            "solve",
+            "--config",
+            fixture().to_str().unwrap(),
+            "--checkpoint-dir",
+            "/tmp/unused_solver_checkpoint_test",
+            "--checkpoint-iterations",
+            "2,1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("strictly increasing"));
+}
+
 fn tournament_fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
 }
 
 fn offsuit_fixture() -> PathBuf {
@@ -38,7 +135,11 @@ fn grid_cell(stdout: &str, row_label: char, col_label: char) -> String {
     let col = (0..13)
         .find(|&c| {
             let start = 5 + c * COL_WIDTH;
-            std::str::from_utf8(&header[start..start + COL_WIDTH]).unwrap().trim().chars().next()
+            std::str::from_utf8(&header[start..start + COL_WIDTH])
+                .unwrap()
+                .trim()
+                .chars()
+                .next()
                 == Some(col_label)
         })
         .expect("column label not found in grid header");
@@ -51,7 +152,10 @@ fn grid_cell(stdout: &str, row_label: char, col_label: char) -> String {
         let label = std::str::from_utf8(&bytes[0..4]).unwrap().trim();
         if label.len() == 1 && label.chars().next() == Some(row_label) {
             let start = 5 + col * COL_WIDTH;
-            return std::str::from_utf8(&bytes[start..start + COL_WIDTH]).unwrap().trim().to_string();
+            return std::str::from_utf8(&bytes[start..start + COL_WIDTH])
+                .unwrap()
+                .trim()
+                .to_string();
         }
     }
     panic!("row label {row_label:?} not found in grid:\n{stdout}");
@@ -82,7 +186,10 @@ fn solve_then_show_end_to_end() {
         "solve exited {:?}\nstdout:\n{solve_stdout}\nstderr:\n{solve_stderr}",
         solve.status.code()
     );
-    assert!(solve_stdout.contains("decision"), "expected tree stats: {solve_stdout}");
+    assert!(
+        solve_stdout.contains("decision"),
+        "expected tree stats: {solve_stdout}"
+    );
     assert!(
         solve_stdout.contains("[measured]"),
         "exploitability figures must be labeled measured: {solve_stdout}"
@@ -91,7 +198,10 @@ fn solve_then_show_end_to_end() {
         solve_stdout.contains("=== final report ==="),
         "missing final report: {solve_stdout}"
     );
-    assert!(solve_stdout.contains("OOP EV"), "missing OOP EV line: {solve_stdout}");
+    assert!(
+        solve_stdout.contains("OOP EV"),
+        "missing OOP EV line: {solve_stdout}"
+    );
     assert!(out.exists(), "solution file was not written to {out:?}");
 
     let show = bin()
@@ -111,9 +221,18 @@ fn solve_then_show_end_to_end() {
         "show exited {:?}\nstdout:\n{show_stdout}\nstderr:\n{show_stderr}",
         show.status.code()
     );
-    assert!(show_stdout.contains("street River"), "missing node header: {show_stdout}");
-    assert!(show_stdout.contains("legend:"), "missing rank-grid legend: {show_stdout}");
-    assert!(show_stdout.contains('K'), "expected the KK row in the rank grid: {show_stdout}");
+    assert!(
+        show_stdout.contains("street River"),
+        "missing node header: {show_stdout}"
+    );
+    assert!(
+        show_stdout.contains("legend:"),
+        "missing rank-grid legend: {show_stdout}"
+    );
+    assert!(
+        show_stdout.contains('K'),
+        "expected the KK row in the rank grid: {show_stdout}"
+    );
 
     let show_combo = bin()
         .args([
@@ -128,9 +247,19 @@ fn solve_then_show_end_to_end() {
         .output()
         .expect("run show --combo");
     let combo_stdout = String::from_utf8_lossy(&show_combo.stdout);
-    assert!(show_combo.status.success(), "show --combo exited {:?}: {combo_stdout}", show_combo.status.code());
-    assert!(combo_stdout.contains("combo KcKd"), "missing combo header: {combo_stdout}");
-    assert!(combo_stdout.contains("call"), "expected a call line for a value hand: {combo_stdout}");
+    assert!(
+        show_combo.status.success(),
+        "show --combo exited {:?}: {combo_stdout}",
+        show_combo.status.code()
+    );
+    assert!(
+        combo_stdout.contains("combo KcKd"),
+        "missing combo header: {combo_stdout}"
+    );
+    assert!(
+        combo_stdout.contains("call"),
+        "expected a call line for a value hand: {combo_stdout}"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -156,12 +285,24 @@ fn show_rejects_a_line_token_that_does_not_match_any_action() {
     assert!(solve.status.success());
 
     let show = bin()
-        .args(["show", "--solution", out.to_str().unwrap(), "--line", "check,bet:33"])
+        .args([
+            "show",
+            "--solution",
+            out.to_str().unwrap(),
+            "--line",
+            "check,bet:33",
+        ])
         .output()
         .expect("run show");
-    assert!(!show.status.success(), "expected a non-zero exit for an unmatched line token");
+    assert!(
+        !show.status.success(),
+        "expected a non-zero exit for an unmatched line token"
+    );
     let stderr = String::from_utf8_lossy(&show.stderr);
-    assert!(stderr.contains("no action matches"), "unexpected stderr: {stderr}");
+    assert!(
+        stderr.contains("no action matches"),
+        "unexpected stderr: {stderr}"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -187,11 +328,22 @@ fn offsuit_combo_renders_a_non_empty_grid_cell() {
         ])
         .output()
         .expect("run solve");
-    assert!(solve.status.success(), "solve failed: {}", String::from_utf8_lossy(&solve.stderr));
+    assert!(
+        solve.status.success(),
+        "solve failed: {}",
+        String::from_utf8_lossy(&solve.stderr)
+    );
 
     // No --line: the root node is OOP's decision, showing OOP's own range directly.
-    let show = bin().args(["show", "--solution", out.to_str().unwrap()]).output().expect("run show");
-    assert!(show.status.success(), "show failed: {}", String::from_utf8_lossy(&show.stderr));
+    let show = bin()
+        .args(["show", "--solution", out.to_str().unwrap()])
+        .output()
+        .expect("run show");
+    assert!(
+        show.status.success(),
+        "show failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
     let stdout = String::from_utf8_lossy(&show.stdout);
 
     // A4o is live for OOP (unblocked by the board) and sits in the offsuit
@@ -207,7 +359,8 @@ fn offsuit_combo_renders_a_non_empty_grid_cell() {
 // index-out-of-bounds while indexing the strategy array.
 #[test]
 fn show_reports_a_clear_error_instead_of_panicking_on_a_combo_count_mismatch() {
-    let dir = std::env::temp_dir().join(format!("solver_cli_test_combocount_{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("solver_cli_test_combocount_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let out = dir.join("solution.json");
     let tampered = dir.join("tampered.json");
@@ -224,21 +377,44 @@ fn show_reports_a_clear_error_instead_of_panicking_on_a_combo_count_mismatch() {
         ])
         .output()
         .expect("run solve");
-    assert!(solve.status.success(), "solve failed: {}", String::from_utf8_lossy(&solve.stderr));
+    assert!(
+        solve.status.success(),
+        "solve failed: {}",
+        String::from_utf8_lossy(&solve.stderr)
+    );
 
     let mut sol = Solution::load(&out).expect("load solution");
-    let root = sol.nodes.iter_mut().find(|n| n.node == 0).expect("root node strategy");
-    assert!(root.combo_count >= 2, "fixture must have at least 2 live combos to tamper with");
+    let root = sol
+        .nodes
+        .iter_mut()
+        .find(|n| n.node == 0)
+        .expect("root node strategy");
+    assert!(
+        root.combo_count >= 2,
+        "fixture must have at least 2 live combos to tamper with"
+    );
     let actions = root.actions.len();
     root.combo_count -= 1;
     root.strategy.truncate(actions * root.combo_count as usize);
     sol.save(&tampered).expect("save tampered solution");
 
-    let show = bin().args(["show", "--solution", tampered.to_str().unwrap()]).output().expect("run show");
+    let show = bin()
+        .args(["show", "--solution", tampered.to_str().unwrap()])
+        .output()
+        .expect("run show");
     let stderr = String::from_utf8_lossy(&show.stderr);
-    assert!(!show.status.success(), "expected show to fail (not panic-crash) on a combo-count mismatch");
-    assert!(!stderr.contains("panicked"), "show must not panic on a stale/tampered solution file: {stderr}");
-    assert!(stderr.contains("node 0"), "error must name the offending node: {stderr}");
+    assert!(
+        !show.status.success(),
+        "expected show to fail (not panic-crash) on a combo-count mismatch"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "show must not panic on a stale/tampered solution file: {stderr}"
+    );
+    assert!(
+        stderr.contains("node 0"),
+        "error must name the offending node: {stderr}"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -264,13 +440,21 @@ fn grid_cell_keeps_the_action_code_and_frequency_separated_at_every_width() {
         ])
         .output()
         .expect("run solve");
-    assert!(solve.status.success(), "solve failed: {}", String::from_utf8_lossy(&solve.stderr));
+    assert!(
+        solve.status.success(),
+        "solve failed: {}",
+        String::from_utf8_lossy(&solve.stderr)
+    );
 
     // Force a pure (100%-frequency) bet strategy at the root so the dominant
     // action's code and its frequency are both known exactly, instead of relying
     // on CFR convergence to happen to land on 100%.
     let mut sol = Solution::load(&out).expect("load solution");
-    let root = sol.nodes.iter_mut().find(|n| n.node == 0).expect("root node strategy");
+    let root = sol
+        .nodes
+        .iter_mut()
+        .find(|n| n.node == 0)
+        .expect("root node strategy");
     let bet_idx = root
         .actions
         .iter()
@@ -285,14 +469,24 @@ fn grid_cell_keeps_the_action_code_and_frequency_separated_at_every_width() {
     }
     sol.save(&forced).expect("save forced solution");
 
-    let show = bin().args(["show", "--solution", forced.to_str().unwrap()]).output().expect("run show");
-    assert!(show.status.success(), "show failed: {}", String::from_utf8_lossy(&show.stderr));
+    let show = bin()
+        .args(["show", "--solution", forced.to_str().unwrap()])
+        .output()
+        .expect("run show");
+    assert!(
+        show.status.success(),
+        "show failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
     let stdout = String::from_utf8_lossy(&show.stdout);
 
     // KK is a pure pair (row 'K', col 'K'), always bucketed correctly even before
     // Finding A's fix, so this test isolates Finding C.
     let cell = grid_cell(&stdout, 'K', 'K');
-    assert_eq!(cell, "B100 100%", "code and frequency ran together with no separator:\n{stdout}");
+    assert_eq!(
+        cell, "B100 100%",
+        "code and frequency ran together with no separator:\n{stdout}"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -328,7 +522,10 @@ stderr:
         solve.status.code()
     );
 
-    assert!(stdout.contains("NashConv"), "missing the NashConv headline: {stdout}");
+    assert!(
+        stdout.contains("NashConv"),
+        "missing the NashConv headline: {stdout}"
+    );
     assert!(
         !stdout.contains("exploitability"),
         "a general-sum solve must never print the word exploitability: {stdout}"
@@ -362,7 +559,11 @@ stderr:
             .expect("bubble factor parses as a number");
         factors.push(f);
     }
-    assert_eq!(factors.len(), 2, "expected one bubble factor per seat: {stdout}");
+    assert_eq!(
+        factors.len(),
+        2,
+        "expected one bubble factor per seat: {stdout}"
+    );
     assert!(
         factors.iter().all(|f| *f > 1.0),
         "both seats are on a bubble, so both factors must exceed 1: {factors:?}"
@@ -388,7 +589,10 @@ stderr:
         "expected a non-zero exit for a seat that does not exist: {}",
         String::from_utf8_lossy(&bad.stdout)
     );
-    assert!(!bad_stderr.contains("panicked"), "must not panic: {bad_stderr}");
+    assert!(
+        !bad_stderr.contains("panicked"),
+        "must not panic: {bad_stderr}"
+    );
     assert!(
         bad_stderr.contains("tournament.seats[1] is 9"),
         "the error must name the offending seat: {bad_stderr}"

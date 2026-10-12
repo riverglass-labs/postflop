@@ -1,5 +1,6 @@
 //! `solver`: command-line front end for the postflop solving engine.
 
+mod research;
 mod show;
 mod solve;
 
@@ -25,6 +26,8 @@ enum Command {
     Solve(solve::SolveArgs),
     /// Inspect a saved solution without re-solving.
     Show(show::ShowArgs),
+    /// Batch equity features and controlled policy EV experiments.
+    Research(research::ResearchArgs),
 }
 
 fn main() -> ExitCode {
@@ -32,6 +35,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Solve(args) => solve::run(args),
         Command::Show(args) => show::run(args),
+        Command::Research(args) => research::run(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -2131,22 +2131,23 @@ mod tests {
         );
     }
 
-    /// In the chip game `gain` is the best-response value itself, bit for bit, and the
-    /// two sum to exactly the number this crate has always called exploitability. That
-    /// identity is what makes the new field free on the chip path.
+    /// Individual chip-EV gains subtract the profile game value; raw BR values
+    /// may be negative. Their sum agrees with aggregate exploitability.
     #[test]
-    fn gain_is_the_best_response_value_in_the_chip_game() {
-        for (name, cfg) in [("milestone 3", milestone3_cfg()), ("bubble shape", bubble_cfg())] {
+    fn gain_subtracts_profile_ev_in_the_chip_game() {
+        for (name, cfg) in [
+            ("milestone 3", milestone3_cfg()),
+            ("bubble shape", bubble_cfg()),
+        ] {
             let (s, _) = solve(&cfg, 2_000, 0);
             let r = s.exploitability();
             assert!(s.game().zero_sum(), "{name}: a chip game is zero-sum");
-            assert_eq!(r.gain, r.br, "{name}: gain must be br exactly");
-            assert_eq!(
-                r.gain[0] + r.gain[1],
-                r.chips,
-                "{name}: gain must sum to the reported figure"
-            );
-            println!("{name}: br {:?} gain {:?} chips {:.9}", r.br, r.gain, r.chips);
+            for hero in 0..2 {
+                assert_eq!(r.gain[hero], r.br[hero] - s.expected_value(hero as u8));
+                assert!(r.gain[hero] >= -1e-3);
+            }
+            assert!((r.gain[0] + r.gain[1] - r.chips).abs() < 1e-5);
+            assert_eq!(r.chips, r.br[0] + r.br[1]);
         }
     }
 

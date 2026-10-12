@@ -426,6 +426,8 @@ dependencies = [
  "clap",
  "engine",
  "rayon",
+ "serde",
+ "serde_json",
  "toml",
 ]
 
