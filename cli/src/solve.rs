@@ -24,6 +24,7 @@ use std::time::Instant;
 use clap::{Args, ValueEnum};
 use engine::cfr::{DcfrParams, Solver, StorageMode};
 use engine::config::{SolveConfig, Tournament};
+use engine::current_street::CurrentStreetPolicy;
 use engine::icm;
 use engine::nlhe::NlheGame;
 use engine::solution::Solution;
@@ -88,6 +89,17 @@ pub struct SolveArgs {
     /// Write the solved strategy here. Omit to solve-and-print only.
     #[arg(long)]
     out: Option<PathBuf>,
+    /// Export only the starting street's decision policy (compact JSON).
+    #[arg(long = "current-street-out")]
+    current_street_out: Option<PathBuf>,
+    /// Directory for compact current-street policies at exact iteration checkpoints.
+    /// Each file is named iter_000030.json (six or more digits as needed).
+    #[arg(long = "checkpoint-dir")]
+    checkpoint_dir: Option<PathBuf>,
+    /// Comma-separated checkpoints. Defaults to 30,50,75,100,150,250 when
+    /// --checkpoint-dir is set. One Solver continues across every checkpoint.
+    #[arg(long = "checkpoint-iterations", value_delimiter = ',')]
+    checkpoint_iterations: Option<Vec<u64>>,
     /// Per-node regret/strategy storage. `i16` roughly halves peak memory; results
     /// are the same up to the codec's quantization error. See `StorageMode`. That
     /// error was measured on chip payoffs only: with `--tournament`, i16 parity is
@@ -98,7 +110,9 @@ pub struct SolveArgs {
 
 pub fn run(args: SolveArgs) -> Result<(), String> {
     if args.report_every == 0 {
-        return Err("--report-every must be at least 1 (it drives the stop-condition check)".into());
+        return Err(
+            "--report-every must be at least 1 (it drives the stop-condition check)".into(),
+        );
     }
 
     let text = std::fs::read_to_string(&args.config)
@@ -131,6 +145,27 @@ pub fn run(args: SolveArgs) -> Result<(), String> {
     }
     cfg.validate()?;
 
+    let checkpoints = match (&args.checkpoint_dir, &args.checkpoint_iterations) {
+        (None, None) => Vec::new(),
+        (None, Some(_)) => return Err("--checkpoint-iterations requires --checkpoint-dir".into()),
+        (Some(_), Some(values)) => values.clone(),
+        (Some(_), None) => vec![30, 50, 75, 100, 150, 250],
+    };
+    if !checkpoints.is_empty() {
+        if checkpoints[0] == 0 || checkpoints.windows(2).any(|w| w[0] >= w[1]) {
+            return Err("--checkpoint-iterations must be positive and strictly increasing".into());
+        }
+        if checkpoints[checkpoints.len() - 1] > cfg.max_iterations {
+            return Err(format!(
+                "last checkpoint {} exceeds max_iterations {}; pass --max-iterations",
+                checkpoints[checkpoints.len() - 1],
+                cfg.max_iterations
+            ));
+        }
+        std::fs::create_dir_all(args.checkpoint_dir.as_ref().unwrap())
+            .map_err(|e| format!("cannot create checkpoint directory: {e}"))?;
+    }
+
     if cfg.turn_chance_sampling {
         return Err(
             "turn_chance_sampling is set, but exact search is the only mode implemented so far \
@@ -140,7 +175,10 @@ pub fn run(args: SolveArgs) -> Result<(), String> {
     }
 
     if let Some(n) = args.threads {
-        if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(n).build_global() {
+        if let Err(e) = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+        {
             eprintln!("warning: could not configure the rayon thread pool ({e}); continuing");
         }
     }
@@ -160,25 +198,75 @@ pub fn run(args: SolveArgs) -> Result<(), String> {
     let start = Instant::now();
     let mut done = 0u64;
     let mut last_pct = f32::INFINITY;
-    while done < cfg.max_iterations {
-        let chunk = args.report_every.min(cfg.max_iterations - done);
-        solver.run(chunk, &params, chunk, |i, chips, pct| {
-            println!("iter {i:>8}  {metric} {chips:.6} {unit}  {pct:.4}% of pot  [measured]");
-            last_pct = pct;
-        });
-        done += chunk;
-        if (last_pct as f64) <= cfg.target_exploitability {
-            break;
+    if checkpoints.is_empty() {
+        while done < cfg.max_iterations {
+            let chunk = args.report_every.min(cfg.max_iterations - done);
+            solver.run(chunk, &params, chunk, |i, chips, pct| {
+                println!("iter {i:>8}  {metric} {chips:.6} {unit}  {pct:.4}% of pot  [measured]");
+                last_pct = pct;
+            });
+            done += chunk;
+            if (last_pct as f64) <= cfg.target_exploitability {
+                break;
+            }
+        }
+    } else {
+        println!(
+            "checkpoint mode: solving through max_iterations regardless of target_exploitability"
+        );
+        for &checkpoint in &checkpoints {
+            solver.run(checkpoint - done, &params, 0, |_, _, _| {});
+            done = checkpoint;
+            let report = solver.exploitability();
+            let measured_at = start.elapsed().as_secs_f64();
+            let policy =
+                CurrentStreetPolicy::from_solver_with_report(&solver, measured_at, report)?;
+            let filename = format!("iter_{checkpoint:06}.json");
+            let path = args.checkpoint_dir.as_ref().unwrap().join(filename);
+            policy.save_atomic(&path)?;
+            let bytes = std::fs::metadata(&path)
+                .map_err(|e| format!("cannot stat {path:?}: {e}"))?
+                .len();
+            println!(
+                "checkpoint iter {checkpoint:>8}  {metric} {:.6} {unit}  {:.4}% of pot  {:.3} s  {bytes} bytes  {} [measured]",
+                report.chips,
+                report.pct_of_pot,
+                measured_at,
+                path.display()
+            );
+        }
+        while done < cfg.max_iterations {
+            let chunk = args.report_every.min(cfg.max_iterations - done);
+            solver.run(chunk, &params, chunk, |i, chips, pct| {
+                println!("iter {i:>8}  {metric} {chips:.6} {unit}  {pct:.4}% of pot  [measured]");
+                last_pct = pct;
+            });
+            done += chunk;
         }
     }
     let wall_seconds = start.elapsed().as_secs_f64();
 
-    print_final_report(&solver, wall_seconds);
+    let final_report = print_final_report(&solver, wall_seconds);
 
     if let Some(out) = args.out {
         let sol = Solution::from_solver(&solver, wall_seconds);
         sol.save(&out)?;
         println!("wrote {}", out.display());
+    }
+    if let Some(out) = args.current_street_out {
+        let export_start = Instant::now();
+        let policy =
+            CurrentStreetPolicy::from_solver_with_report(&solver, wall_seconds, final_report)?;
+        policy.save(&out)?;
+        let bytes = std::fs::metadata(&out)
+            .map_err(|e| format!("cannot stat {:?}: {e}", out))?
+            .len();
+        println!(
+            "wrote current-street policy {} ({} bytes, {:.4} s export) [measured]",
+            out.display(),
+            bytes,
+            export_start.elapsed().as_secs_f64()
+        );
     }
     Ok(())
 }
@@ -210,7 +298,7 @@ fn print_tree_stats(solver: &Solver<NlheGame>) {
     println!("chance maps: {} bytes [measured]", game.chance_map_bytes());
 }
 
-fn print_final_report(solver: &Solver<NlheGame>, wall_seconds: f64) {
+fn print_final_report(solver: &Solver<NlheGame>, wall_seconds: f64) -> engine::br::ExploitReport {
     let game = solver.game();
     let cfg = game.config();
     let report = solver.exploitability();
@@ -246,8 +334,14 @@ fn print_final_report(solver: &Solver<NlheGame>, wall_seconds: f64) {
         println!("{who} EV: zero-sum {zero_sum:.4}  pot-share {pot_share:.4}  [measured]");
     }
     if let Some(t) = &cfg.tournament {
-        print_icm_block(game, t, report.gain, matches!(solver.storage_mode(), StorageMode::I16));
+        print_icm_block(
+            game,
+            t,
+            report.gain,
+            matches!(solver.storage_mode(), StorageMode::I16),
+        );
     }
+    report
 }
 
 /// The tournament half of the final report: which table seats are in the hand, what
@@ -260,7 +354,9 @@ fn print_final_report(solver: &Solver<NlheGame>, wall_seconds: f64) {
 /// quoted factor well inside the four decimals printed here.
 fn print_icm_block(game: &NlheGame, t: &Tournament, gain: [f32; 2], i16: bool) {
     let counts = game.tree().counts();
-    let base = game.icm_base_stacks().expect("an ICM solve has a base stack vector");
+    let base = game
+        .icm_base_stacks()
+        .expect("an ICM solve has a base stack vector");
     let bf = icm::bubble_factors(base, &t.payouts);
     let paid = t.payouts.len().min(t.stacks.len());
     for (p, g) in gain.iter().enumerate() {

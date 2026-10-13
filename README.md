@@ -374,3 +374,51 @@ are a separate project for the same reason.
 ## License
 
 MIT
+# Compact current-street policy export
+
+`solver solve --config spot.toml --current-street-out policy.json` writes a
+versioned JSON policy for the starting street only. This can be requested with
+or without the existing `--out` full-solution file. For a flop solve, it keeps
+flop decisions and marks turn chance nodes as `street_boundary`; for a turn
+solve, it keeps turn decisions; for a river solve, it keeps river decisions.
+
+The v1 file has `format_version`, full `config`, measured `meta`, `street`,
+`root_node`, `full_tree_node_count`, two `combos` arrays (OOP/IP, canonical exact
+combo order), and `nodes`. A node has its original tree ID, acting player,
+public pot/stacks, legal actions, and an action-major `f32` strategy array:
+`strategy[action_index * combos[player].len() + combo_index]`. Every action has
+an `action_id` line token, a semantic `label`, `amount_to` (street total),
+`amount_put`, resulting pot/stacks, and a tagged child of `decision`,
+`street_boundary`, or `hand_terminal`. The exporter verifies the combo order
+is constant on the current street. Zero-reach combos follow the solver's
+documented uniform average-strategy fallback.
+
+This file is a policy snapshot, not a resumable full solve. It contains no
+later-street decisions and cannot supply turn/river policy from a flop export.
+
+For convergence experiments, pass `--checkpoint-dir DIR --max-iterations 250`.
+The default checkpoints are 30, 50, 75, 100, 150, and 250; override them with
+`--checkpoint-iterations 1,2,3` for a smoke run. The same Solver continues
+between checkpoints, and each `DIR/iter_000030.json` file is published by an
+atomic rename. The `meta` block records measured exploitability, elapsed time,
+CFR storage bytes, and chance-map bytes. Peak process memory must be measured
+by the caller. Checkpoint mode runs to `max_iterations` regardless of the
+exploitability stop target. Omit `--out` to avoid the full-tree JSON. A policy
+snapshot cannot resume CFR after interruption; restart that board from zero.
+
+### Reuse a complete research continuation
+
+Research `evaluate` accepts `export_solution` on a fresh checkpoint solve and
+`load_solution` for subsequent candidate evaluation. The latter loads every
+flop/turn/river average-strategy row, runs zero CFR iterations and allocates no
+CFR regret/strategy-sum arrays. It validates configuration, tree shape, action
+order, root combo order and complete legal probability rows; no uniform fallback
+fills missing rows. Reference EV and BR values are computed once per batch.
+
+Full exports stream node by node in the existing lossless `Solution` JSON format.
+They contain average policies, not resumable internal CFR state. A loaded request
+must omit `checkpoints` and `export_solution`. Python orchestration additionally
+pins source, binary, input and solution hashes, and may losslessly gzip/stage the
+JSON. Results include phase timings, `reference_source` and
+`cfr_iterations_run`; fresh exports include their byte count and serialization
+time. Candidate policies still replace only specified flop actors.

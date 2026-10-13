@@ -43,8 +43,8 @@
 //! That is how much player `i` picks up by deviating alone while the opponent keeps
 //! playing the profile. [`ExploitReport::gain`] holds the pair and [`ExploitReport::chips`]
 //! their sum, **NashConv**. In a zero-sum game `EV_0 + EV_1 == 0`, so NashConv is
-//! numerically the figure this module has always reported: `gain` is then exactly `br`,
-//! and the chip path takes that branch without the two extra walks, bit for bit.
+//! numerically the figure this module has always reported. Individual gains still
+//! subtract player EV: a raw best-response value may be negative.
 //!
 //! What NashConv certifies, and what it does not. It measures one profile: at zero,
 //! neither player can improve unilaterally, which is a Nash equilibrium of the
@@ -128,22 +128,17 @@ pub fn exploitability<G: Game, P: StrategyProfile>(game: &G, profile: &P) -> Exp
         best_response_value(game, 0, profile),
         best_response_value(game, 1, profile),
     ];
-    // Zero-sum: `EV_0 + EV_1 == 0`, so `gain[0] + gain[1] == br[0] + br[1]` exactly and
-    // the two expected-value walks would only recompute a cancelling pair. Taking this
-    // branch is what keeps every chip solve bit-identical to before `gain` existed.
-    let gain = if game.zero_sum() {
-        br
-    } else {
-        [
-            br[0] - expected_value(game, 0, profile),
-            br[1] - expected_value(game, 1, profile),
-        ]
-    };
+    // Raw BR values can be negative in a zero-sum game with a nonzero
+    // game value. Unilateral gains must subtract the profile's player EV.
+    let gain = [
+        br[0] - expected_value(game, 0, profile),
+        br[1] - expected_value(game, 1, profile),
+    ];
     debug_assert!(
         gain[0] >= -1e-3 && gain[1] >= -1e-3,
         "a unilateral best response cannot lose to the profile it deviates from: gain {gain:?}"
     );
-    let chips = gain[0] + gain[1];
+    let chips = if game.zero_sum() { br[0] + br[1] } else { gain[0] + gain[1] };
     ExploitReport { br, gain, chips, pct_of_pot: 100.0 * chips / game.root_pot() }
 }
 

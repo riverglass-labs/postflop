@@ -132,14 +132,16 @@ fn match_action(
         let want: i64 = pct_str.trim().parse().ok()?;
         return actions.iter().position(|a| {
             matches!(a.label, ActionLabel::Bet(_))
-                && action_percent(tree, node, player, actions, a).map(|p| p.round() as i64) == Some(want)
+                && action_percent(tree, node, player, actions, a).map(|p| p.round() as i64)
+                    == Some(want)
         });
     }
     if let Some(pct_str) = low.strip_prefix("raise:") {
         let want: i64 = pct_str.trim().parse().ok()?;
         return actions.iter().position(|a| {
             matches!(a.label, ActionLabel::Raise(_))
-                && action_percent(tree, node, player, actions, a).map(|p| p.round() as i64) == Some(want)
+                && action_percent(tree, node, player, actions, a).map(|p| p.round() as i64)
+                    == Some(want)
         });
     }
     let want_label = match low.as_str() {
@@ -168,7 +170,9 @@ fn action_percent(
     match action.label {
         ActionLabel::Bet(amount) => Some(100.0 * amount / n.pot),
         ActionLabel::Raise(_) => {
-            let call = actions.iter().find(|a| matches!(a.label, ActionLabel::Call))?;
+            let call = actions
+                .iter()
+                .find(|a| matches!(a.label, ActionLabel::Call))?;
             let post_call_pot = tree.node(call.child).pot;
             let to_call = post_call_pot - n.pot;
             let added = n.stacks[player as usize] - tree.node(action.child).stacks[player as usize];
@@ -180,7 +184,13 @@ fn action_percent(
 }
 
 /// Short grid/legend code: "F"/"X"/"C"/"A" or "B<pct>"/"R<pct>".
-fn short_code(tree: &GameTree, node: u32, player: u8, actions: &[Action], action: &Action) -> String {
+fn short_code(
+    tree: &GameTree,
+    node: u32,
+    player: u8,
+    actions: &[Action],
+    action: &Action,
+) -> String {
     match action.label {
         ActionLabel::Fold => "F".to_string(),
         ActionLabel::Check => "X".to_string(),
@@ -197,7 +207,13 @@ fn short_code(tree: &GameTree, node: u32, player: u8, actions: &[Action], action
     }
 }
 
-fn describe_action(tree: &GameTree, node: u32, player: u8, actions: &[Action], action: &Action) -> String {
+fn describe_action(
+    tree: &GameTree,
+    node: u32,
+    player: u8,
+    actions: &[Action],
+    action: &Action,
+) -> String {
     match action.label {
         ActionLabel::Fold => "fold".to_string(),
         ActionLabel::Check => "check".to_string(),
@@ -205,11 +221,17 @@ fn describe_action(tree: &GameTree, node: u32, player: u8, actions: &[Action], a
         ActionLabel::AllIn => "allin".to_string(),
         ActionLabel::Bet(amount) => {
             let pct = action_percent(tree, node, player, actions, action).unwrap_or(f64::NAN);
-            format!("bet:{} ({amount:.2} chips, {pct:.1}% pot)", pct.round() as i64)
+            format!(
+                "bet:{} ({amount:.2} chips, {pct:.1}% pot)",
+                pct.round() as i64
+            )
         }
         ActionLabel::Raise(amount) => {
             let pct = action_percent(tree, node, player, actions, action).unwrap_or(f64::NAN);
-            format!("raise:{} (to {amount:.2} chips, {pct:.1}% pot)", pct.round() as i64)
+            format!(
+                "raise:{} (to {amount:.2} chips, {pct:.1}% pot)",
+                pct.round() as i64
+            )
         }
     }
 }
@@ -354,7 +376,11 @@ fn print_combo(
     for (a, action) in actions.iter().enumerate() {
         let code = short_code(tree, node, player, actions, action);
         let freq = ns.strategy[a * combo_count + slot];
-        println!("  {code:<5} {:<16} {:.2}%", label_text(action.label), freq * 100.0);
+        println!(
+            "  {code:<5} {:<16} {:.2}%",
+            label_text(action.label),
+            freq * 100.0
+        );
     }
     Ok(())
 }

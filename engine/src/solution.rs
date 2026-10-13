@@ -33,7 +33,8 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::cards;
 use crate::cfr::Solver;
@@ -176,16 +177,22 @@ impl Solution {
     /// Builds a [`Solution`] from a solved [`Solver`], capturing every decision
     /// node's current average strategy.
     pub fn from_solver(solver: &Solver<NlheGame>, wall_seconds: f64) -> Solution {
+        let root_ev_zero_sum = [solver.expected_value(0), solver.expected_value(1)];
+        let report = solver.exploitability();
+        Self::from_solver_with_values(solver, wall_seconds, root_ev_zero_sum, report)
+    }
+
+    /// Serialize identical average rows using already measured root values.
+    /// Caller must supply measurements of this exact solver's current average.
+    pub fn from_solver_with_values(
+        solver: &Solver<NlheGame>,
+        wall_seconds: f64,
+        root_ev_zero_sum: [f32; 2],
+        report: crate::br::ExploitReport,
+    ) -> Solution {
+        let mut solution = Self::header_from_solver(solver, wall_seconds, root_ev_zero_sum, report);
         let game = solver.game();
         let tree = game.tree();
-
-        let root_ev_zero_sum = [solver.expected_value(0), solver.expected_value(1)];
-        let root_ev_pot_share = [
-            game.ev_pot_share(0, root_ev_zero_sum[0]),
-            game.ev_pot_share(1, root_ev_zero_sum[1]),
-        ];
-        let report = solver.exploitability();
-
         let mut nodes = Vec::new();
         for idx in 0..tree.len() as u32 {
             if let NodeKind::Decision { player, actions } = &tree.node(idx).kind {
@@ -199,6 +206,22 @@ impl Solution {
             }
         }
 
+        solution.nodes = nodes;
+        solution
+    }
+
+    fn header_from_solver(
+        solver: &Solver<NlheGame>,
+        wall_seconds: f64,
+        root_ev_zero_sum: [f32; 2],
+        report: crate::br::ExploitReport,
+    ) -> Solution {
+        let game = solver.game();
+        let tree = game.tree();
+        let root_ev_pot_share = [
+            game.ev_pot_share(0, root_ev_zero_sum[0]),
+            game.ev_pot_share(1, root_ev_zero_sum[1]),
+        ];
         let root = game.root();
         let root_combos = std::array::from_fn(|p| {
             let p = p as u8;
@@ -230,7 +253,10 @@ impl Solution {
                 iterations: solver.iterations(),
                 exploitability_chips: report.chips,
                 exploitability_pct_of_pot: report.pct_of_pot,
-                root_evs: RootEvs { zero_sum: root_ev_zero_sum, pot_share: root_ev_pot_share },
+                root_evs: RootEvs {
+                    zero_sum: root_ev_zero_sum,
+                    pot_share: root_ev_pot_share,
+                },
                 wall_seconds,
                 engine_version: env!("CARGO_PKG_VERSION").to_string(),
                 // A tournament block now means the payoffs really are tournament
@@ -245,9 +271,24 @@ impl Solution {
                 gain: report.gain,
             },
             node_count: tree.len() as u32,
-            nodes,
+            nodes: vec![],
             root_combos,
         }
+    }
+
+    /// Write the existing lossless Solution schema directly from the solver.
+    /// Only one node's average vector is materialized at a time, avoiding a
+    /// second complete strategy copy while CFR arrays remain resident.
+    pub fn stream_solver_with_values<W: Write>(
+        solver: &Solver<NlheGame>,
+        writer: W,
+        wall_seconds: f64,
+        root_ev_zero_sum: [f32; 2],
+        report: crate::br::ExploitReport,
+    ) -> Result<(), String> {
+        let header = Self::header_from_solver(solver, wall_seconds, root_ev_zero_sum, report);
+        serde_json::to_writer(writer, &StreamSolution { solver, header })
+            .map_err(|e| format!("cannot stream solution: {e}"))
     }
 
     /// Streams this solution to `path` as JSON. Files can run tens of MB, so this
@@ -386,6 +427,44 @@ impl Solution {
     }
 }
 
+struct StreamSolution<'a> {
+    solver: &'a Solver<NlheGame>,
+    header: Solution,
+}
+impl Serialize for StreamSolution<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let h = &self.header;
+        let mut map = serializer.serialize_map(Some(6))?;
+        map.serialize_entry("format_version", &h.format_version)?;
+        map.serialize_entry("config", &h.config)?;
+        map.serialize_entry("meta", &h.meta)?;
+        map.serialize_entry("node_count", &h.node_count)?;
+        map.serialize_entry("nodes", &StreamNodes(self.solver))?;
+        map.serialize_entry("root_combos", &h.root_combos)?;
+        map.end()
+    }
+}
+struct StreamNodes<'a>(&'a Solver<NlheGame>);
+impl Serialize for StreamNodes<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let game = self.0.game();
+        let tree = game.tree();
+        let mut seq = serializer.serialize_seq(None)?;
+        for id in 0..tree.len() as u32 {
+            if let NodeKind::Decision { player, actions } = &tree.node(id).kind {
+                seq.serialize_element(&NodeStrategy {
+                    node: id,
+                    player: *player,
+                    actions: actions.iter().map(|a| a.label.into()).collect(),
+                    combo_count: game.live_combos(id, *player).len() as u32,
+                    strategy: self.0.average_strategy(id),
+                })?;
+            }
+        }
+        seq.end()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,10 +497,27 @@ mod tests {
     }
 
     #[test]
+    fn streaming_export_is_byte_identical_to_full_capture() {
+        let solver = solved();
+        let ev = [solver.expected_value(0), solver.expected_value(1)];
+        let report = solver.exploitability();
+        let full = Solution::from_solver_with_values(&solver, 0.123, ev, report);
+        let mut captured = vec![];
+        full.to_writer(&mut captured).unwrap();
+        let mut streamed = vec![];
+        Solution::stream_solver_with_values(&solver, &mut streamed, 0.123, ev, report).unwrap();
+        assert_eq!(streamed, captured);
+        assert_eq!(Solution::from_reader(streamed.as_slice()).unwrap(), full);
+    }
+
+    #[test]
     fn round_trip_is_bit_identical() {
         let solver = solved();
         let sol = Solution::from_solver(&solver, 0.0123);
-        assert_eq!(sol.format_version, 1, "a lock-free solve stays readable by v1 builds");
+        assert_eq!(
+            sol.format_version, 1,
+            "a lock-free solve stays readable by v1 builds"
+        );
         assert!(!sol.nodes.is_empty());
 
         let dir = std::env::temp_dir();
@@ -430,7 +526,10 @@ mod tests {
         let loaded = Solution::load(&path).expect("load");
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(loaded, sol, "loaded solution must be bit-identical to the saved one");
+        assert_eq!(
+            loaded, sol,
+            "loaded solution must be bit-identical to the saved one"
+        );
         // Spot-check against the live solver directly, not just self-consistency.
         for ns in &sol.nodes {
             assert_eq!(ns.strategy, solver.average_strategy(ns.node));
@@ -459,7 +558,10 @@ mod tests {
         let err = Solution::load(&path).expect_err("tampered file must fail to load");
         std::fs::remove_file(&path).ok();
 
-        assert!(err.contains("action count mismatch"), "unexpected error: {err}");
+        assert!(
+            err.contains("action count mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     /// A lock is part of the spot, so it travels in the embedded config and the guard
@@ -483,8 +585,15 @@ mod tests {
 
         let sol = Solution::from_solver(&solver, 0.0);
         assert_eq!(sol.format_version, 2, "locks arrived in format version 2");
-        assert_eq!(sol.config.locks, cfg.locks, "the lock is embedded, not dropped");
-        let stored = sol.nodes.iter().find(|n| n.node == node).expect("locked node stored");
+        assert_eq!(
+            sol.config.locks, cfg.locks,
+            "the lock is embedded, not dropped"
+        );
+        let stored = sol
+            .nodes
+            .iter()
+            .find(|n| n.node == node)
+            .expect("locked node stored");
         let n = stored.combo_count as usize;
         assert_eq!(
             stored.strategy,
@@ -501,12 +610,19 @@ mod tests {
         // Tamper: the stored strategy drifts off the lock it claims to have been solved
         // under. That file is not a solve of the spot its config describes.
         let mut bad = sol.clone();
-        let ns = bad.nodes.iter_mut().find(|n| n.node == node).expect("locked node");
+        let ns = bad
+            .nodes
+            .iter_mut()
+            .find(|n| n.node == node)
+            .expect("locked node");
         ns.strategy[0] = 0.9;
         bad.save(&path).expect("save");
         let err = Solution::load(&path).expect_err("a drifted lock must not load");
         std::fs::remove_file(&path).ok();
-        assert!(err.contains("not the locked distribution"), "unexpected error: {err}");
+        assert!(
+            err.contains("not the locked distribution"),
+            "unexpected error: {err}"
+        );
     }
 
     /// A version-1 file has no `locks` key at all, which is exactly what an unlocked
@@ -524,7 +640,10 @@ mod tests {
         let loaded = Solution::load(&path).expect("an older format version still loads");
         std::fs::remove_file(&path).ok();
 
-        assert!(!text.contains("locks"), "an unlocked config writes no locks key");
+        assert!(
+            !text.contains("locks"),
+            "an unlocked config writes no locks key"
+        );
         assert_eq!(loaded.format_version, 1);
         assert!(loaded.config.locks.is_empty());
     }
@@ -548,8 +667,14 @@ mod tests {
         solver.run(500, &DcfrParams::default(), 0, |_, _, _| {});
 
         let sol = Solution::from_solver(&solver, 0.0);
-        assert_eq!(sol.format_version, 3, "a tournament block arrived in format version 3");
-        assert_eq!(sol.config.tournament, cfg.tournament, "the block is embedded, not dropped");
+        assert_eq!(
+            sol.format_version, 3,
+            "a tournament block arrived in format version 3"
+        );
+        assert_eq!(
+            sol.config.tournament, cfg.tournament,
+            "the block is embedded, not dropped"
+        );
         assert_eq!(
             sol.meta.payoff_unit, "cste",
             "the ICM payoff branch is live, so this solve is scored in tournament equity"
@@ -587,17 +712,32 @@ mod tests {
     fn a_pre_v3_file_without_the_new_meta_keys_still_loads() {
         let solver = solved();
         let sol = Solution::from_solver(&solver, 0.0);
-        assert_eq!(sol.format_version, 1, "a plain chip solve is still stamped v1");
+        assert_eq!(
+            sol.format_version, 1,
+            "a plain chip solve is still stamped v1"
+        );
 
         let mut doc = serde_json::to_value(&sol).expect("to value");
         let meta = doc["meta"].as_object_mut().expect("meta is an object");
-        assert!(meta.remove("payoff_unit").is_some(), "key must exist to be removed");
-        assert!(meta.remove("gain").is_some(), "key must exist to be removed");
+        assert!(
+            meta.remove("payoff_unit").is_some(),
+            "key must exist to be removed"
+        );
+        assert!(
+            meta.remove("gain").is_some(),
+            "key must exist to be removed"
+        );
         let text = serde_json::to_string(&doc).expect("to string");
-        assert!(!text.contains("payoff_unit"), "the pre-v3 shape has no such key");
+        assert!(
+            !text.contains("payoff_unit"),
+            "the pre-v3 shape has no such key"
+        );
 
         let loaded = Solution::from_reader(text.as_bytes()).expect("a pre-v3 file still loads");
-        assert_eq!(loaded.meta.payoff_unit, "chips", "every solve before v3 was in chips");
+        assert_eq!(
+            loaded.meta.payoff_unit, "chips",
+            "every solve before v3 was in chips"
+        );
         assert_eq!(
             loaded.meta.gain,
             [0.0, 0.0],
@@ -612,12 +752,19 @@ mod tests {
         sol.format_version = 999;
 
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("solution_future_version_{}.json", std::process::id()));
+        let path = dir.join(format!(
+            "solution_future_version_{}.json",
+            std::process::id()
+        ));
         sol.save(&path).expect("save");
-        let err = Solution::load(&path).expect_err("a file from a newer format must not load silently");
+        let err =
+            Solution::load(&path).expect_err("a file from a newer format must not load silently");
         std::fs::remove_file(&path).ok();
 
         assert!(err.contains("999"), "unexpected error: {err}");
-        assert!(err.contains(&FORMAT_VERSION.to_string()), "unexpected error: {err}");
+        assert!(
+            err.contains(&FORMAT_VERSION.to_string()),
+            "unexpected error: {err}"
+        );
     }
 }
