@@ -445,7 +445,11 @@ pub(crate) fn regret_matching(regrets: &[f32], n_act: usize, n_combo: usize, out
             let inv = 1.0 / sum;
             for a in 0..n_act {
                 let r = regrets[a * n_combo + i];
-                out[a * n_combo + i] = if r > 0.0 { r * inv } else { 0.0 };
+                out[a * n_combo + i] = if r > 0.0 {
+                    // A subnormal positive sum can have an infinite reciprocal.
+                    // Dividing directly preserves its finite probability ratios.
+                    if sum < f32::MIN_POSITIVE { r / sum } else { r * inv }
+                } else { 0.0 };
             }
         } else {
             for a in 0..n_act {
@@ -783,7 +787,12 @@ impl<G: Game> Solver<G> {
             if total > 0.0 {
                 let inv = 1.0 / total;
                 for a in 0..num_actions {
-                    out[a * n_combo + i] = out[a * n_combo + i].max(0.0) * inv;
+                    let weight = out[a * n_combo + i].max(0.0);
+                    out[a * n_combo + i] = if total < f32::MIN_POSITIVE {
+                        weight / total
+                    } else {
+                        weight * inv
+                    };
                 }
             } else {
                 for a in 0..num_actions {
@@ -1545,6 +1554,28 @@ mod compressed_tests {
 mod tests {
     use super::*;
     use crate::game::ChanceEdge;
+
+    #[test]
+    fn subnormal_regrets_preserve_probability_ratios() {
+        let unit = f32::from_bits(1);
+        let regrets = [unit, 0.0, 3.0 * unit, 0.0];
+        let mut actual = [0.0; 4];
+        regret_matching(&regrets, 2, 2, &mut actual);
+        assert_eq!(actual, [0.25, 0.5, 0.75, 0.5]);
+        assert!(actual.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn subnormal_average_weights_preserve_probability_ratios() {
+        let mut solver = Solver::new(PublicCard::new());
+        let unit = f32::from_bits(1);
+        let off = solver.offsets[1] as usize;
+        let Array::F32(weights) = &mut solver.strat_sum else {
+            unreachable!()
+        };
+        weights[off..off + 4].copy_from_slice(&[unit, 0.0, 3.0 * unit, 0.0]);
+        assert_eq!(solver.average_strategy(1), [0.25, 0.5, 0.75, 0.5]);
+    }
 
     /// Smallest game that exercises the chance machinery the NLHE tree will lean on:
     /// a chance edge that **shrinks** both players' combo sets, with a different

@@ -590,6 +590,7 @@ fn evaluate(request: &Value, output: &PathBuf) -> Result<Value, String> {
             br::best_response_value(solver.game(), 0, &profile),
             br::best_response_value(solver.game(), 1, &profile),
         ];
+        require_finite_reference(ev, br)?;
         let report = br::ExploitReport {
             br,
             gain: [br[0] - ev[0], br[1] - ev[1]],
@@ -712,6 +713,13 @@ fn validate_evaluation_request<P: StrategyProfile>(
     Ok(())
 }
 
+fn require_finite_reference(ev: [f32; 2], br: [f32; 2]) -> Result<(), String> {
+    if ev.iter().chain(br.iter()).any(|v| !v.is_finite()) {
+        return Err(format!("non-finite reference EV/BR: ev={ev:?}, br={br:?}"));
+    }
+    Ok(())
+}
+
 fn evaluate_profile<P: StrategyProfile>(
     request: &Value,
     cfg: &SolveConfig,
@@ -736,6 +744,7 @@ fn evaluate_profile<P: StrategyProfile>(
             ],
         )
     });
+    require_finite_reference(reference_ev, reference_br)?;
     let reference_seconds = reference_clock.elapsed().as_secs_f64();
     let evaluation_clock = Instant::now();
     let action_clock = Instant::now();
@@ -929,6 +938,13 @@ pub fn run(args: ResearchArgs) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonfinite_reference_values_fail_explicitly() {
+        assert!(require_finite_reference([0.0, 0.0], [0.0, 0.0]).is_ok());
+        assert!(require_finite_reference([f32::NAN, 0.0], [0.0, 0.0]).is_err());
+        assert!(require_finite_reference([0.0, 0.0], [0.0, f32::INFINITY]).is_err());
+    }
 
     fn continuation_cfg() -> SolveConfig {
         let mut cfg = SolveConfig::default();
