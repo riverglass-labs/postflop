@@ -497,10 +497,22 @@ fn evaluate(request: &Value, output: &PathBuf) -> Result<Value, String> {
         if sol.config != cfg {
             return Err("loaded solution config mismatch".into());
         }
-        if request.get("checkpoints").is_some() || request.get("export_solution").is_some() {
+        if request.get("checkpoints").is_some()
+            || request.get("export_solution").is_some()
+            || request.get("stop_at_exploitability_pct_pot").is_some()
+        {
             return Err("loaded evaluation cannot run checkpoints or export a new solve".into());
         }
     }
+    // Optional precision stop: after each checkpoint, finish at the first one whose
+    // measured exploitability is at or below this percent of the starting pot.
+    let stop_at = match request.get("stop_at_exploitability_pct_pot") {
+        None => None,
+        Some(v) => match v.as_f64() {
+            Some(t) if t.is_finite() && t > 0.0 => Some(t),
+            _ => return Err("stop_at_exploitability_pct_pot must be a positive number".into()),
+        },
+    };
     let checkpoints: Vec<u64> = if loaded.is_some() {
         vec![]
     } else {
@@ -614,6 +626,9 @@ fn evaluate(request: &Value, output: &PathBuf) -> Result<Value, String> {
         audits.push(json!({"iterations":iteration,"wall_seconds":clock.elapsed().as_secs_f64(),"cfr_seconds":solve_seconds,"reference_report_seconds":report_seconds,"export":path,
             "ev":ev,"br":report.br,"exploitability_pct_pot":report.pct_of_pot}));
         atomic_json(output, &json!({"status":"running","checkpoints":audits}))?;
+        if stop_at.is_some_and(|t| f64::from(report.pct_of_pot) <= t) {
+            break;
+        }
     }
     let game = solver.game();
     let base = solver.average();
@@ -661,6 +676,11 @@ fn evaluate(request: &Value, output: &PathBuf) -> Result<Value, String> {
     result["timings"]["game_construction_seconds"] = json!(construction_seconds);
     result["wall_seconds"] = json!(construction_clock.elapsed().as_secs_f64());
     result["cfr_iterations_run"] = json!(solver.iterations());
+    if let Some(t) = stop_at {
+        let last = result["checkpoints"].as_array().and_then(|a| a.last());
+        let pct = last.and_then(|c| c["exploitability_pct_pot"].as_f64());
+        result["stopped_at_target"] = json!(pct.is_some_and(|p| p <= t));
+    }
     Ok(result)
 }
 
@@ -1127,6 +1147,65 @@ mod tests {
         assert!(candidate_rows(&candidate, &teacher, &[0, 1]).is_ok());
         candidate.nodes[0].actions[0].amount_put += 0.01;
         assert!(candidate_rows(&candidate, &teacher, &[0, 1]).is_err());
+    }
+
+    #[test]
+    fn precision_stop_ends_at_first_checkpoint_within_target() {
+        let cfg = continuation_cfg();
+        let dir = std::env::temp_dir().join(format!("research_stop_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("solve.json");
+        let grid = [5, 10, 20, 40, 80];
+        let full = evaluate(&json!({"config":cfg,"checkpoints":grid}), &output).unwrap();
+        let pct: Vec<f64> = full["checkpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["exploitability_pct_pot"].as_f64().unwrap())
+            .collect();
+        assert!(full.get("stopped_at_target").is_none());
+        // Stop target just above the third checkpoint's precision; the first
+        // checkpoint at or below it must end the solve (the curve is not monotone,
+        // so find it rather than assume it is the third).
+        let target = pct[2] * 1.0001;
+        let stop = pct.iter().position(|&p| p <= target).unwrap();
+        for f in fs::read_dir(&dir).unwrap() {
+            fs::remove_file(f.unwrap().path()).unwrap();
+        }
+        let early = evaluate(
+            &json!({"config":cfg,"checkpoints":grid,"stop_at_exploitability_pct_pot":target}),
+            &output,
+        )
+        .unwrap();
+        assert_eq!(early["cfr_iterations_run"], grid[stop]);
+        assert_eq!(early["stopped_at_target"], true);
+        assert_eq!(early["checkpoints"].as_array().unwrap().len(), stop + 1);
+        assert_eq!(
+            early["checkpoints"][stop]["exploitability_pct_pot"],
+            full["checkpoints"][stop]["exploitability_pct_pot"]
+        );
+        assert!(output
+            .with_extension(format!("iter_{:06}.json", grid[stop]))
+            .exists());
+        assert!(!output
+            .with_extension(format!("iter_{:06}.json", grid[stop + 1]))
+            .exists());
+        // A target never reached runs the whole grid and says so.
+        let never = evaluate(
+            &json!({"config":cfg,"checkpoints":grid,"stop_at_exploitability_pct_pot":1e-12}),
+            &output,
+        )
+        .unwrap();
+        assert_eq!(never["cfr_iterations_run"], 80);
+        assert_eq!(never["stopped_at_target"], false);
+        for bad in [json!(0.0), json!(-1.0), json!("0.1")] {
+            assert!(evaluate(
+                &json!({"config":cfg,"checkpoints":grid,"stop_at_exploitability_pct_pot":bad}),
+                &output
+            )
+            .is_err());
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

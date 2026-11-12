@@ -417,7 +417,15 @@ fills missing rows. Reference EV and BR values are computed once per batch.
 
 Full exports stream node by node in the existing lossless `Solution` JSON format.
 They contain average policies, not resumable internal CFR state. A loaded request
-must omit `checkpoints` and `export_solution`. Python orchestration additionally
+must omit `checkpoints`, `export_solution` and `stop_at_exploitability_pct_pot`.
+
+A fresh `evaluate` may set `stop_at_exploitability_pct_pot` (percent of the
+starting pot). The solve then ends at the first checkpoint whose measured
+exploitability is at or below it; later checkpoints are not run or written. The
+result's `cfr_iterations_run` is the iteration it stopped at and
+`stopped_at_target` says whether the target was reached by the last checkpoint.
+Each checkpoint's `cfr_seconds` covers only the iterations since the previous
+one; sum them for the total. Python orchestration additionally
 pins source, binary, input and solution hashes, and may losslessly gzip/stage the
 JSON. Results include phase timings, `reference_source` and
 `cfr_iterations_run`; fresh exports include their byte count and serialization
