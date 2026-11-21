@@ -12,6 +12,7 @@ use engine::{
     solution::{ActionLabelData, Solution},
     tree::NodeKind,
 };
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -104,17 +105,20 @@ fn equity(req: EquityRequest) -> Result<Value, String> {
                 .collect::<Result<Vec<_>, String>>()
         })
         .collect::<Result<_, _>>()?;
+    // Each hand is computed on its own (its own seed and sums), so hands run in
+    // parallel and the sorted map makes the output identical to a sequential run.
     let mut out = [BTreeMap::new(), BTreeMap::new()];
     for player in 0..2 {
-        for (name, h, _, own, own_turns) in &ranges[player] {
+        let rows: Vec<(String, Value)> = ranges[player]
+            .par_iter()
+            .map(|(name, h, _, own, own_turns)| {
             let opp: Vec<_> = ranges[1 - player]
                 .iter()
                 .filter(|(_, v, _, _, _)| !h.contains(&v[0]) && !h.contains(&v[1]))
                 .collect();
             let mass: f64 = opp.iter().map(|(_, _, w, _, _)| *w).sum();
             if mass <= 0.0 {
-                out[player].insert(name.clone(), json!({"positive_joint_reach":false}));
-                continue;
+                return (name.clone(), json!({"positive_joint_reach":false}));
             }
             let strength: f64 = opp
                 .iter()
@@ -222,11 +226,13 @@ fn equity(req: EquityRequest) -> Result<Value, String> {
                 .map(|(_, x, p)| (x - turn_mean).powi(2) * p)
                 .sum::<f64>()
                 .sqrt();
-            out[player].insert(name.clone(),json!({"positive_joint_reach":true,"current_strength":strength,"showdown_equity":sum,
+            (name.clone(),json!({"positive_joint_reach":true,"current_strength":strength,"showdown_equity":sum,
                 "equity_standard_error":se,"sample_count":count,"equity_half_sample_delta":if req.exact {0.0} else {(half/(req.samples/2) as f64-sum).abs()},
                 "future_strength_hist":hist,"future_strength_mean":turn_mean,"future_strength_std":turn_std,
-                "positive_potential":positive,"negative_potential":negative,"turn_strength":turn_values}));
-        }
+                "positive_potential":positive,"negative_potential":negative,"turn_strength":turn_values}))
+            })
+            .collect();
+        out[player].extend(rows);
     }
     Ok(
         json!({"format_version":2,"method":if req.exact {"exact_legal_pair_runouts"} else {"weighted_opponent_legal_runout_sampling"},"players":out}),
